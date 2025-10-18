@@ -111,7 +111,9 @@ class AttentionWithBias(nn.Module):
 
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)
-        attn = attn + attn_bias
+        if attn_bias is not None:
+            H_bias, W_bias = attn_bias.shape[2:4]
+            attn[:, :, -H_bias:, -W_bias:] = attn[:, :, -H_bias:, -W_bias:] + attn_bias
         attn = maybe_add_mask(attn, attn_mask)
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -121,6 +123,69 @@ class AttentionWithBias(nn.Module):
         x = self.norm(x)
         x = self.proj(x)
         x = self.proj_drop(x)
+        return x
+
+class PieceClassifier(nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int = 8,
+            kernel_size: int = 1,
+            num_classes: int = 17,
+            has_class_token: bool = True,
+            qk_norm: bool = False,
+            scale_norm: bool = False,
+            norm_layer: Optional[Type[nn.Module]] = None,
+            device=None,
+            dtype=None
+    ) -> None:
+        """Initialize the Attention module.
+
+        Args:
+            dim: Input dimension of the token embeddings
+            num_heads: Number of attention heads
+            qkv_bias: Whether to use bias in the query, key, value projections
+            qk_norm: Whether to apply normalization to query and key vectors
+            proj_bias: Whether to use bias in the output projection
+            attn_drop: Dropout rate applied to the attention weights
+            proj_drop: Dropout rate applied after the output projection
+            norm_layer: Normalization layer constructor for QK normalization if enabled
+        """
+        super().__init__()
+        dd = {'device': device, 'dtype': dtype}
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        if qk_norm or scale_norm:
+            assert norm_layer is not None, 'norm_layer must be provided if qk_norm or scale_norm is True'
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.has_class_token = has_class_token
+        self.scale = self.head_dim ** -0.5
+
+        self.qk = nn.Linear(dim, dim * 2, **dd)
+        self.q_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
+        self.conv = nn.Conv2d(self.num_heads, self.num_heads, kernel_size, kernel_size)
+        self.clf = nn.Sequential(
+            nn.Tanh(),
+            nn.Linear(self.num_heads, num_classes),
+        )
+
+    def forward(
+            self,
+            x: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.has_class_token:
+            x = x[:, 1:, :]
+        B, N, C = x.shape
+        qk = self.qk(x).reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k = qk.unbind(0) # B, num_heads, N, head_dim
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1) # B, num_heads, N, N
+        x = self.conv(attn)
+        x = x.permute(0,2,3,1)
+        x = self.clf(x)
         return x
 
 
@@ -196,8 +261,8 @@ class Block(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values, **dd) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), attn_mask=attn_mask)))
+    def forward(self, x: torch.Tensor, attn_bias: Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias, attn_mask=attn_mask)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
@@ -564,6 +629,8 @@ class PuzzleTransformer(nn.Module):
         embed_norm_layer = get_norm_layer(embed_norm_layer)
         act_layer = get_act_layer(act_layer) or nn.GELU
 
+        self.img_size = img_size
+        self.patch_size = patch_size
         self.num_classes = num_classes
         self.global_pool = global_pool
         self.num_heads = num_heads
@@ -594,11 +661,11 @@ class PuzzleTransformer(nn.Module):
             **embed_args,
             **dd,
         )
-        self.piece_pos_embeds = {
-            piece_size: nn.Parameter(   torch.zeros(1, (img_size // piece_size) ** 2, embed_dim, **dd) * .02)
-            for piece_size in piece_sizes
-        }
-        self.connect_embed = nn.Embedding(16, self.embed_dim)
+        self.piece_pos_embeds = nn.ParameterDict()
+        for piece_size in piece_sizes:
+            piece_pos_embed = nn.Parameter(torch.zeros(1, (img_size // piece_size), (img_size // piece_size), embed_dim, **dd) * .02)
+            self.piece_pos_embeds[str(piece_size)] = piece_pos_embed
+        self.connect_embed = nn.Embedding(17, self.num_heads)
         self.piece_type_embed = nn.Embedding(10, self.embed_dim, padding_idx=0)
         self.piece_type_embed.weight.data.normal_(std=0.02)
 
@@ -663,6 +730,32 @@ class PuzzleTransformer(nn.Module):
         self.head_drop = nn.Dropout(drop_rate)
         self.head = nn.Linear(self.embed_dim, num_classes, **dd) if num_classes > 0 else nn.Identity()
 
+        self.connect_classifiers = nn.ModuleDict()
+        self.piece_classifiers = nn.ModuleDict()
+        for piece_size in piece_sizes:
+            kernel_size = (img_size // patch_size) // (piece_size // patch_size)
+            self.connect_classifiers[str(piece_size)] = PieceClassifier(
+                dim=embed_dim,
+                num_heads=num_heads,
+                kernel_size=kernel_size,
+                num_classes=17,
+                has_class_token=self.has_class_token,
+                norm_layer=norm_layer,
+                **dd,
+            )
+            self.piece_classifiers[str(piece_size)] = PieceClassifier(
+                dim=embed_dim,
+                num_heads=num_heads,
+                kernel_size=kernel_size,
+                num_classes=(img_size // piece_size) ** 2,
+                has_class_token=self.has_class_token,
+                norm_layer=norm_layer,
+                **dd,
+            )
+
+
+
+
         if weight_init != 'skip':
             self.init_weights(weight_init)
         if fix_init:
@@ -691,6 +784,10 @@ class PuzzleTransformer(nn.Module):
             nn.init.normal_(self.cls_token, std=1e-6)
         if self.reg_token is not None:
             nn.init.normal_(self.reg_token, std=1e-6)
+        if self.piece_pos_embeds is not None:
+            for piece_size, pos_embed in self.piece_pos_embeds.items():
+                trunc_normal_(pos_embed, std=.02)
+        
 
         named_apply(get_init_weights_vit(mode, head_bias), self)
 
@@ -863,7 +960,11 @@ class PuzzleTransformer(nn.Module):
         # forward pass
         B, _, height, width = x.shape
         x = self.patch_embed(x)
-        x = x + self.piece_pos_embeds[piece_size]
+        if piece_size is not None:
+            piece_pos_embed = self.piece_pos_embeds[str(piece_size)]
+            piece_pos_embed = piece_pos_embed.repeat_interleave(piece_size//self.patch_size, dim=1).repeat_interleave(piece_size//self.patch_size, dim=2)
+            piece_pos_embed = piece_pos_embed.reshape(1, (self.img_size // self.patch_size) **2, self.embed_dim)
+        x = x + piece_pos_embed
         x = self._pos_embed(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
@@ -981,25 +1082,29 @@ class PuzzleTransformer(nn.Module):
             attn_mask=attn_mask,
         )
     
-    def _connect_embed(self, connects: torch.LongTensor) -> torch.Tensor:
-        b, h, w, c = connects.shape # b 16 16 5
-        l = h
-        connect_embed = self.connect_embed(connects) # B 16,16,D
-        connect_embed = connect_embed.reshape(b, l, c)
-        connect_embed = connect_embed.reshape(b, l, -1, self.head_dim)
+    def _connect_embed(self, connects: torch.LongTensor, piece_size=None) -> torch.Tensor:
+        connect_embed = self.connect_embed(connects) # B N,N,D
+        B, N, _, D = connect_embed.shape
+        n = int(math.sqrt(N))
+        connect_embed = connect_embed.permute(0, 3, 1, 2)  # B,D,N,N
+        connect_embed = connect_embed.reshape(B, D, n, n, n, n)
+        connect_embed = connect_embed.repeat_interleave(piece_size // self.patch_size, dim=2).repeat_interleave(piece_size // self.patch_size, dim=3).repeat_interleave(piece_size // self.patch_size, dim=4).repeat_interleave(piece_size // self.patch_size, dim=5)
+        connect_embed = connect_embed.flatten(2,3).flatten(3,4)  # B,D, N',N'
         return connect_embed
     
-    def forward_features(self, x: torch.Tensor, piece_size: int, connects: torch.LongTensor = None,  attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor, piece_size: int = None, connects: torch.LongTensor = None, attn_bias=None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
         x = self.patch_embed(x)
-        x = x + self.piece_pos_embeds[piece_size]
+        if piece_size is not None:
+            piece_pos_embed = self.piece_pos_embeds[str(piece_size)]
+            piece_pos_embed = piece_pos_embed.repeat_interleave(piece_size//self.patch_size, dim=1).repeat_interleave(piece_size//self.patch_size, dim=2)
+            piece_pos_embed = piece_pos_embed.reshape(1, (self.img_size // self.patch_size) **2, self.embed_dim)
+            x = x + piece_pos_embed
         x = self._pos_embed(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
         if connects is not None:
-            attn_bias = self._connect_embed(connects)
-        else:
-            attn_bias = 0
+            attn_bias = self._connect_embed(connects, piece_size=piece_size)
 
         for blk in self.blocks:
             x = blk(x, attn_bias=attn_bias, attn_mask=attn_mask)
@@ -1047,10 +1152,16 @@ class PuzzleTransformer(nn.Module):
         x = self.head_drop(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x: torch.Tensor, piece_size, connects, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, piece_size: int = None, connects: torch.LongTensor = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.forward_features(x, piece_size, connects, attn_mask=attn_mask)
-        x = self.forward_head(x)
+        if piece_size is not None:
+            if connects is not None:
+                x = self.piece_classifiers[str(piece_size)](x)
+            else:
+                x = self.connect_classifiers[str(piece_size)](x)
         return x
+
+
 
 
 def init_weights_vit_timm(module: nn.Module, name: str = '') -> None:
