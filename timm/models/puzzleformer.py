@@ -2,6 +2,7 @@ import copy
 import logging
 import math
 import os
+import numpy as np
 from collections import OrderedDict
 from functools import partial
 from typing import Any, Callable, Dict, Optional, Set, Tuple, Type, Union, List
@@ -52,6 +53,67 @@ __all__ = ['PuzzleTransformer']  # model_registry will add each entrypoint fn to
 
 
 _logger = logging.getLogger(__name__)
+
+def get_adjacency_matrix(n:int, shuffle_order:List[int], rotate_order:List[int]): # 패치에 대하여 연결된 패치 찾기
+    label_map_dict = {
+        (0,0):1, # i 패치의 down과 j 패치의 down 연결되어 있을 때
+        (0,1):2, # i 패치의 down과 j 패치의 left 연결되어 있을 때
+        (0,2):3, # i 패치의 down과 j 패치의 up 연결되어 있을 때
+        (0,3):4, # i 패치의 down과 j 패치의 right 연결되어 있을 때
+        (1,0):5, # i 패치의 left과 j 패치의 down 연결되어 있을 때
+        (1,1):6, # i 패치의 left과 j 패치의 left 연결되어 있을 때
+        (1,2):7, # i 패치의 left과 j 패치의 up 연결되어 있을 때
+        (1,3):8, # i 패치의 left과 j 패치의 right 연결되어 있을 때
+        (2,0):9, # i 패치의 up과 j 패치의 down 연결되어 있을 때
+        (2,1):10, # i 패치의 up과 j 패치의 left 연결되어 있을 때
+        (2,2):11, # i 패치의 up과 j 패치의 up 연결되어 있을 때
+        (2,3):12, # i 패치의 up과 j 패치의 right 연결되어 있을 때
+        (3,0):13, # i 패치의 right과 j 패치의 down 연결되어 있을 때
+        (3,1):14, # i 패치의 right과 j 패치의 left 연결되어 있을 때
+        (3,2):15, # i 패치의 right과 j 패치의 up 연결되어 있을 때
+        (3,3):16 # i 패치의 right과 j 패치의 right 연결되어 있을 때
+    }
+    sqrt_n = int(n**0.5)
+    shuffle_order_matrix = [shuffle_order[sqrt_n*i:sqrt_n*(i+1)]for i in range(sqrt_n)]
+    adj_matrix = np.zeros((n,n), dtype=int)
+    for i in range(sqrt_n):
+        for j in range(sqrt_n):
+            o = shuffle_order_matrix[i][j]
+            i_o, j_o = divmod(o,sqrt_n)
+            for i_add,j_add in [(-1,0), (1,0), (0,1), (0,-1)]:
+                i_compare, j_compare = i_o+i_add, j_o+j_add
+                if i_compare<0 or i_compare>=sqrt_n or j_compare<0 or j_compare>=sqrt_n : continue
+                i_, j_ = i*sqrt_n+j, shuffle_order.index(i_compare*sqrt_n+j_compare)
+                i_rotate, j_rotate = rotate_order[i_], rotate_order[j_]
+                if (i_add,j_add) != (-1,0):
+                    adj_matrix[i_][j_] = label_map_dict[((i_rotate+2)%4,j_rotate)] # 상
+                    adj_matrix[j_][i_] = label_map_dict[(j_rotate, (i_rotate+2)%4)] # 하
+                elif (i_add,j_add) != (1,0):
+                    adj_matrix[i_][j_] = label_map_dict[(j_rotate, (i_rotate+2)%4)] # 하
+                    adj_matrix[j_][i_] = label_map_dict[((i_rotate+2)%4,j_rotate)] # 상
+                elif  (i_add,j_add) != (0,-1):
+                    adj_matrix[i_][j_] = label_map_dict[((i_rotate+1)%4, (j_rotate+3)%4)] # 좌
+                    adj_matrix[j_][i_] = label_map_dict[((j_rotate+3)%4, (i_rotate+1)%4)] # 우
+                elif (i_add,j_add) != (0,1):
+                    adj_matrix[i_][j_] = label_map_dict[((i_rotate+3)%4, (j_rotate+1)%4)] # 우
+                    adj_matrix[j_][i_] = label_map_dict[((j_rotate+1)%4, (i_rotate+3)%4)] # 좌
+    return adj_matrix
+
+def connect_to_piece_type(connect):
+    piece_types = []
+    for connect_row in connect:
+        n_connect = np.bincount(connect_row)[1:].sum()
+        if n_connect == 2:
+            piece_types.append(1)
+        elif n_connect == 3:
+            piece_types.append(2)
+        elif n_connect == 4:
+            piece_types.append(3)
+        else:
+            piece_types.append(0)
+
+    return piece_types
+
 
 class AttentionWithBias(nn.Module):
     def __init__(
@@ -125,7 +187,7 @@ class AttentionWithBias(nn.Module):
         x = self.proj_drop(x)
         return x
 
-class PieceClassifier(nn.Module):
+class ConnectClassifier(nn.Module):
     def __init__(
             self,
             dim: int,
@@ -185,6 +247,51 @@ class PieceClassifier(nn.Module):
         attn = q @ k.transpose(-2, -1) # B, num_heads, N, N
         x = self.conv(attn)
         x = x.permute(0,2,3,1)
+        x = self.clf(x)
+        return x
+    
+class PieceClassifier(nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            kernel_size: int = 1,
+            num_classes: int = 256,
+            has_class_token: bool = True,
+            device=None,
+            dtype=None
+    ) -> None:
+        """Initialize the Attention module.
+
+        Args:
+            dim: Input dimension of the token embeddings
+            num_heads: Number of attention heads
+            qkv_bias: Whether to use bias in the query, key, value projections
+            qk_norm: Whether to apply normalization to query and key vectors
+            proj_bias: Whether to use bias in the output projection
+            attn_drop: Dropout rate applied to the attention weights
+            proj_drop: Dropout rate applied after the output projection
+            norm_layer: Normalization layer constructor for QK normalization if enabled
+        """
+        super().__init__()
+        dd = {'device': device, 'dtype': dtype}
+        self.has_class_token = has_class_token
+
+
+        self.conv = nn.Conv1d(dim, dim, kernel_size, kernel_size)
+        self.clf = nn.Sequential(
+            nn.Tanh(),
+            nn.Linear(dim, num_classes),
+        )
+
+    def forward(
+            self,
+            x: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.has_class_token:
+            x = x[:, 1:, :]
+        x = x.transpose(1,2)
+        x = self.conv(x)
+        x = x.transpose(1,2)
         x = self.clf(x)
         return x
 
@@ -631,6 +738,7 @@ class PuzzleTransformer(nn.Module):
 
         self.img_size = img_size
         self.patch_size = patch_size
+        self.piece_sizes = piece_sizes
         self.num_classes = num_classes
         self.global_pool = global_pool
         self.num_heads = num_heads
@@ -662,11 +770,14 @@ class PuzzleTransformer(nn.Module):
             **dd,
         )
         self.piece_pos_embeds = nn.ParameterDict()
+        self.connect_buffers = nn.ParameterDict()
         for piece_size in piece_sizes:
             piece_pos_embed = nn.Parameter(torch.zeros(1, (img_size // piece_size), (img_size // piece_size), embed_dim, **dd) * .02)
             self.piece_pos_embeds[str(piece_size)] = piece_pos_embed
+            n = (img_size // piece_size)**2
+            self.connect_buffers[str(piece_size)] = nn.Parameter(torch.LongTensor(get_adjacency_matrix(n, range(n), [0]*n)).unsqueeze(0), requires_grad=False)
         self.connect_embed = nn.Embedding(17, self.num_heads)
-        self.piece_type_embed = nn.Embedding(10, self.embed_dim, padding_idx=0)
+        self.piece_type_embed = nn.Embedding(4, self.embed_dim, padding_idx=0)
         self.piece_type_embed.weight.data.normal_(std=0.02)
 
         num_patches = self.patch_embed.num_patches
@@ -731,10 +842,11 @@ class PuzzleTransformer(nn.Module):
         self.head = nn.Linear(self.embed_dim, num_classes, **dd) if num_classes > 0 else nn.Identity()
 
         self.connect_classifiers = nn.ModuleDict()
-        self.piece_classifiers = nn.ModuleDict()
+        self.shuffle_classifiers = nn.ModuleDict()
+        self.rotate_classifiers = nn.ModuleDict()
         for piece_size in piece_sizes:
-            kernel_size = (img_size // patch_size) // (piece_size // patch_size)
-            self.connect_classifiers[str(piece_size)] = PieceClassifier(
+            kernel_size = (piece_size // patch_size) ** 2
+            self.connect_classifiers[str(piece_size)] = ConnectClassifier(
                 dim=embed_dim,
                 num_heads=num_heads,
                 kernel_size=kernel_size,
@@ -743,18 +855,20 @@ class PuzzleTransformer(nn.Module):
                 norm_layer=norm_layer,
                 **dd,
             )
-            self.piece_classifiers[str(piece_size)] = PieceClassifier(
+            self.shuffle_classifiers[str(piece_size)] = PieceClassifier(
                 dim=embed_dim,
-                num_heads=num_heads,
                 kernel_size=kernel_size,
                 num_classes=(img_size // piece_size) ** 2,
                 has_class_token=self.has_class_token,
-                norm_layer=norm_layer,
                 **dd,
             )
-
-
-
+            self.rotate_classifiers[str(piece_size)] = PieceClassifier(
+                dim=embed_dim,
+                kernel_size=kernel_size,
+                num_classes=4,
+                has_class_token=self.has_class_token,
+                **dd,
+            )
 
         if weight_init != 'skip':
             self.init_weights(weight_init)
@@ -923,164 +1037,6 @@ class PuzzleTransformer(nn.Module):
 
         return self.pos_drop(x)
 
-    def forward_intermediates(
-            self,
-            x: torch.Tensor,
-            piece_size: int,
-            indices: Optional[Union[int, List[int]]] = None,
-            return_prefix_tokens: bool = False,
-            norm: bool = False,
-            stop_early: bool = False,
-            output_fmt: str = 'NCHW',
-            intermediates_only: bool = False,
-            output_dict: bool = False,
-            attn_mask: Optional[torch.Tensor] = None,
-    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]], Dict[str, Any]]:
-        """ Forward features that returns intermediates.
-
-        Args:
-            x: Input image tensor
-            indices: Take last n blocks if int, all if None, select matching indices if sequence
-            return_prefix_tokens: Return both prefix and spatial intermediate tokens
-            norm: Apply norm layer to all intermediates
-            stop_early: Stop iterating over blocks when last desired intermediate hit
-            output_fmt: Shape of intermediate feature outputs
-            intermediates_only: Only return intermediate features
-            output_dict: Return outputs as a dictionary with 'image_features' and 'image_intermediates' keys
-            attn_mask: Optional attention mask for masked attention (e.g., for NaFlex)
-        Returns:
-            A tuple with (final_features, intermediates), a list of intermediate features, or a dictionary containing
-            'image_features' and 'image_intermediates' (and optionally 'image_intermediates_prefix')
-        """
-        assert output_fmt in ('NCHW', 'NLC'), 'Output format must be one of NCHW or NLC.'
-        reshape = output_fmt == 'NCHW'
-        intermediates = []
-        take_indices, max_index = feature_take_indices(len(self.blocks), indices)
-
-        # forward pass
-        B, _, height, width = x.shape
-        x = self.patch_embed(x)
-        if piece_size is not None:
-            piece_pos_embed = self.piece_pos_embeds[str(piece_size)]
-            piece_pos_embed = piece_pos_embed.repeat_interleave(piece_size//self.patch_size, dim=1).repeat_interleave(piece_size//self.patch_size, dim=2)
-            piece_pos_embed = piece_pos_embed.reshape(1, (self.img_size // self.patch_size) **2, self.embed_dim)
-        x = x + piece_pos_embed
-        x = self._pos_embed(x)
-        x = self.patch_drop(x)
-        x = self.norm_pre(x)
-
-        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
-            blocks = self.blocks
-        else:
-            blocks = self.blocks[:max_index + 1]
-        for i, blk in enumerate(blocks):
-            if attn_mask is not None:
-                x = blk(x, attn_mask=attn_mask)
-            elif self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(blk, x)
-            else:
-                x = blk(x)
-            if i in take_indices:
-                # normalize intermediates with final norm layer if enabled
-                intermediates.append(self.norm(x) if norm else x)
-
-        # process intermediates
-        if self.num_prefix_tokens:
-            # split prefix (e.g. class, distill) and spatial feature tokens
-            prefix_tokens = [y[:, 0:self.num_prefix_tokens] for y in intermediates]
-            intermediates = [y[:, self.num_prefix_tokens:] for y in intermediates]
-        else:
-            prefix_tokens = None
-
-        if reshape:
-            # reshape to BCHW output format
-            H, W = self.patch_embed.dynamic_feat_size((height, width))
-            intermediates = [y.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous() for y in intermediates]
-
-        # For dictionary output, handle prefix tokens separately
-        if output_dict:
-            result_dict = {}
-            # Intermediates are always included
-            result_dict['image_intermediates'] = intermediates
-            if prefix_tokens is not None and return_prefix_tokens:
-                result_dict['image_intermediates_prefix'] = prefix_tokens
-
-            # Only include features if not intermediates_only
-            if not intermediates_only:
-                x_final = self.norm(x)
-                result_dict['image_features'] = x_final
-
-            return result_dict
-
-        # For non-dictionary output, maintain the original behavior
-        if not torch.jit.is_scripting() and return_prefix_tokens and prefix_tokens is not None:
-            # return_prefix not support in torchscript due to poor type handling
-            intermediates = list(zip(intermediates, prefix_tokens))
-
-        if intermediates_only:
-            return intermediates
-
-        x = self.norm(x)
-
-        return x, intermediates
-
-    def prune_intermediate_layers(
-            self,
-            indices: Union[int, List[int]] = 1,
-            prune_norm: bool = False,
-            prune_head: bool = True,
-    ) -> List[int]:
-        """Prune layers not required for specified intermediates.
-
-        Args:
-            indices: Indices of intermediate layers to keep.
-            prune_norm: Whether to prune normalization layer.
-            prune_head: Whether to prune the classifier head.
-
-        Returns:
-            List of indices that were kept.
-        """
-        take_indices, max_index = feature_take_indices(len(self.blocks), indices)
-        self.blocks = self.blocks[:max_index + 1]  # truncate blocks
-        if prune_norm:
-            self.norm = nn.Identity()
-        if prune_head:
-            self.fc_norm = nn.Identity()
-            self.reset_classifier(0, '')
-        return take_indices
-
-    def get_intermediate_layers(
-            self,
-            x: torch.Tensor,
-            piece_size: int,
-            n: Union[int, List[int], Tuple[int]] = 1,
-            reshape: bool = False,
-            return_prefix_tokens: bool = False,
-            norm: bool = False,
-            attn_mask: Optional[torch.Tensor] = None,
-    ) -> List[torch.Tensor]:
-        """Get intermediate layer outputs (DINO interface compatibility).
-
-        NOTE: This API is for backwards compat, favour using forward_intermediates() directly.
-
-        Args:
-            x: Input tensor.
-            n: Number or indices of layers.
-            reshape: Reshape to NCHW format.
-            return_prefix_tokens: Return prefix tokens.
-            norm: Apply normalization.
-
-        Returns:
-            List of intermediate features.
-        """
-        return self.forward_intermediates(
-            x, piece_size, n,
-            return_prefix_tokens=return_prefix_tokens,
-            norm=norm,
-            output_fmt='NCHW' if reshape else 'NLC',
-            intermediates_only=True,
-            attn_mask=attn_mask,
-        )
     
     def _connect_embed(self, connects: torch.LongTensor, piece_size=None) -> torch.Tensor:
         connect_embed = self.connect_embed(connects) # B N,N,D
@@ -1092,9 +1048,13 @@ class PuzzleTransformer(nn.Module):
         connect_embed = connect_embed.flatten(2,3).flatten(3,4)  # B,D, N',N'
         return connect_embed
     
-    def forward_features(self, x: torch.Tensor, piece_size: int = None, connects: torch.LongTensor = None, attn_bias=None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor, piece_size: int = None, piece_types: torch.LongTensor = None, connects: torch.LongTensor = None, attn_bias=None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
         x = self.patch_embed(x)
+        if piece_types is not None:
+            piece_type_embed = self.piece_type_embed(piece_types)  # B, N, D
+            piece_type_embed = piece_type_embed.repeat_interleave(piece_size//self.patch_size, dim=1)
+            x = x + piece_type_embed
         if piece_size is not None:
             piece_pos_embed = self.piece_pos_embeds[str(piece_size)]
             piece_pos_embed = piece_pos_embed.repeat_interleave(piece_size//self.patch_size, dim=1).repeat_interleave(piece_size//self.patch_size, dim=2)
@@ -1109,57 +1069,29 @@ class PuzzleTransformer(nn.Module):
         for blk in self.blocks:
             x = blk(x, attn_bias=attn_bias, attn_mask=attn_mask)
 
-
         x = self.norm(x)
         return x
 
-    def pool(self, x: torch.Tensor, pool_type: Optional[str] = None) -> torch.Tensor:
-        """Apply pooling to feature tokens.
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        pass
 
-        Args:
-            x: Feature tensor.
-            pool_type: Pooling type override.
-
-        Returns:
-            Pooled features.
-        """
-        if self.attn_pool is not None:
-            if not self.pool_include_prefix:
-                x = x[:, self.num_prefix_tokens:]
-            x = self.attn_pool(x)
-            return x
-        pool_type = self.global_pool if pool_type is None else pool_type
-        x = global_pool_nlc(
-            x,
-            pool_type=pool_type,
-            num_prefix_tokens=self.num_prefix_tokens,
-            reduce_include_prefix=self.pool_include_prefix,
-        )
-        return x
-
-    def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
-        """Forward pass through classifier head.
-
-        Args:
-            x: Feature tensor.
-            pre_logits: Return features before final classifier.
-
-        Returns:
-            Output tensor.
-        """
-        x = self.pool(x)
-        x = self.fc_norm(x)
-        x = self.head_drop(x)
-        return x if pre_logits else self.head(x)
-
-    def forward(self, x: torch.Tensor, piece_size: int = None, connects: torch.LongTensor = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = self.forward_features(x, piece_size, connects, attn_mask=attn_mask)
-        if piece_size is not None:
-            if connects is not None:
-                x = self.piece_classifiers[str(piece_size)](x)
-            else:
-                x = self.connect_classifiers[str(piece_size)](x)
-        return x
+    
+    def forward_local(self, x: torch.Tensor, piece_size: int = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.forward_features(x, piece_size, attn_mask=attn_mask)
+        logits_connect = self.connect_classifiers[str(piece_size)](x)
+        connects_pred = logits_connect.argmax(dim=-1).detach().cpu().numpy()
+        piece_types = []
+        for connect_pred in connects_pred:
+            piece_type = connect_to_piece_type(connect_pred)
+            piece_types.append(piece_type)
+        piece_types = torch.Tensor(piece_types).type_as(x).long()
+        return logits_connect, piece_types
+    
+    def forward_global(self, x: torch.Tensor, piece_size: int = None, piece_types: torch.LongTensor = None, connects: torch.LongTensor = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.forward_features(x, piece_size, piece_types, connects, attn_mask=attn_mask)
+        logits_shuffle = self.shuffle_classifiers[str(piece_size)](x)
+        logits_rotate = self.rotate_classifiers[str(piece_size)](x)
+        return logits_shuffle, logits_rotate
 
 
 
