@@ -1053,7 +1053,11 @@ class PuzzleTransformer(nn.Module):
         x = self.patch_embed(x)
         if piece_types is not None:
             piece_type_embed = self.piece_type_embed(piece_types)  # B, N, D
-            piece_type_embed = piece_type_embed.repeat_interleave(piece_size//self.patch_size, dim=1)
+            B, N, D = piece_type_embed.shape
+            n = int(math.sqrt(N))
+            piece_type_embed = piece_type_embed.reshape(B, n, n, D)
+            piece_type_embed = piece_type_embed.repeat_interleave(piece_size//self.patch_size, dim=1).repeat_interleave(piece_size//self.patch_size, dim=2)
+            piece_type_embed = piece_type_embed.flatten(1,2)
             x = x + piece_type_embed
         if piece_size is not None:
             piece_pos_embed = self.piece_pos_embeds[str(piece_size)]
