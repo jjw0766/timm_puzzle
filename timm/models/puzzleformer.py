@@ -85,16 +85,16 @@ def get_adjacency_matrix(n:int, shuffle_order:List[int], rotate_order:List[int])
                 if i_compare<0 or i_compare>=sqrt_n or j_compare<0 or j_compare>=sqrt_n : continue
                 i_, j_ = i*sqrt_n+j, shuffle_order.index(i_compare*sqrt_n+j_compare)
                 i_rotate, j_rotate = rotate_order[i_], rotate_order[j_]
-                if (i_add,j_add) != (-1,0):
+                if (i_add,j_add) == (-1,0):
                     adj_matrix[i_][j_] = label_map_dict[((i_rotate+2)%4,j_rotate)] # 상
                     adj_matrix[j_][i_] = label_map_dict[(j_rotate, (i_rotate+2)%4)] # 하
-                elif (i_add,j_add) != (1,0):
-                    adj_matrix[i_][j_] = label_map_dict[(j_rotate, (i_rotate+2)%4)] # 하
-                    adj_matrix[j_][i_] = label_map_dict[((i_rotate+2)%4,j_rotate)] # 상
-                elif  (i_add,j_add) != (0,-1):
+                elif (i_add,j_add) == (1,0):
+                    adj_matrix[i_][j_] = label_map_dict[(i_rotate, (j_rotate+2)%4)] # 하
+                    adj_matrix[j_][i_] = label_map_dict[((j_rotate+2)%4, i_rotate)] # 상
+                elif  (i_add,j_add) == (0,-1):
                     adj_matrix[i_][j_] = label_map_dict[((i_rotate+1)%4, (j_rotate+3)%4)] # 좌
                     adj_matrix[j_][i_] = label_map_dict[((j_rotate+3)%4, (i_rotate+1)%4)] # 우
-                elif (i_add,j_add) != (0,1):
+                elif (i_add,j_add) == (0,1):
                     adj_matrix[i_][j_] = label_map_dict[((i_rotate+3)%4, (j_rotate+1)%4)] # 우
                     adj_matrix[j_][i_] = label_map_dict[((j_rotate+1)%4, (i_rotate+3)%4)] # 좌
     return adj_matrix
@@ -111,7 +111,6 @@ def connect_to_piece_type(connect):
             piece_types.append(3)
         else:
             piece_types.append(0)
-
     return piece_types
 
 
@@ -174,8 +173,7 @@ class AttentionWithBias(nn.Module):
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)
         if attn_bias is not None:
-            H_bias, W_bias = attn_bias.shape[2:4]
-            attn[:, :, -H_bias:, -W_bias:] = attn[:, :, -H_bias:, -W_bias:] + attn_bias
+            attn += attn_bias
         attn = maybe_add_mask(attn, attn_mask)
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -222,14 +220,21 @@ class ConnectClassifier(nn.Module):
         self.head_dim = dim // num_heads
         self.has_class_token = has_class_token
         self.scale = self.head_dim ** -0.5
+        self.kernel_size = kernel_size
+        self.k = int(kernel_size**0.5)
+        self.num_classes = num_classes
 
-        self.qk = nn.Linear(dim, dim * 2, **dd)
-        self.q_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
-        self.conv = nn.Conv2d(self.num_heads, self.num_heads, kernel_size, kernel_size)
+        self.query = nn.Linear(dim, dim * num_classes, **dd)
+        self.key = nn.Linear(dim, dim * num_classes, **dd)
+        # self.q_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
+        # self.k_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
+        # self.conv = nn.AvgPool2d(kernel_size, kernel_size)
+        self.conv = nn.Conv2d(self.num_heads * self.num_classes, self.num_heads * self.num_classes, kernel_size, kernel_size)
+        self.conv.weight.data.fill_(1.0 / (kernel_size * kernel_size))
+        # self.conv = nn.AvgPool2d(kernel_size, kernel_size)
         self.clf = nn.Sequential(
-            nn.Tanh(),
-            nn.Linear(self.num_heads, num_classes),
+            nn.GELU(),
+            nn.Linear(self.num_heads * num_classes, num_classes),
         )
 
     def forward(
@@ -239,11 +244,15 @@ class ConnectClassifier(nn.Module):
         if self.has_class_token:
             x = x[:, 1:, :]
         B, N, C = x.shape
-        qk = self.qk(x).reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k = qk.unbind(0) # B, num_heads, N, head_dim
-        q, k = self.q_norm(q), self.k_norm(k)
+        n = int(N**0.5)
+        x = x.reshape(B, n, n, C)
+        x = x.reshape(B, n//self.k, self.k, n//self.k, self.k, C).permute(0,1,3,2,4,5).reshape(B, (n//self.k)*(n//self.k), self.k*self.k, C)
+        x = x.reshape(B, N, C)
+        q = self.query(x).reshape(B, N, self.num_heads * self.num_classes, self.head_dim).permute(0, 2, 1, 3)
+        k = self.key(x).reshape(B, N, self.num_heads * self.num_classes, self.head_dim).permute(0, 2, 1, 3)
+        # q, k = self.q_norm(q), self.k_norm(k)
+        # q = q * self.scale
 
-        q = q * self.scale
         attn = q @ k.transpose(-2, -1) # B, num_heads, N, N
         x = self.conv(attn)
         x = x.permute(0,2,3,1)
@@ -276,10 +285,9 @@ class PieceClassifier(nn.Module):
         dd = {'device': device, 'dtype': dtype}
         self.has_class_token = has_class_token
 
-
-        self.conv = nn.Conv1d(dim, dim, kernel_size, kernel_size)
+        self.conv = nn.Conv2d(dim, dim, kernel_size, kernel_size)
         self.clf = nn.Sequential(
-            nn.Tanh(),
+            nn.GELU(),
             nn.Linear(dim, num_classes),
         )
 
@@ -289,9 +297,12 @@ class PieceClassifier(nn.Module):
     ) -> torch.Tensor:
         if self.has_class_token:
             x = x[:, 1:, :]
+        B, N, C = x.shape
+        n = int(N**0.5)
         x = x.transpose(1,2)
+        x = x.reshape(B, C, n, n)
         x = self.conv(x)
-        x = x.transpose(1,2)
+        x = x.flatten(2).transpose(1,2)
         x = self.clf(x)
         return x
 
@@ -373,250 +384,6 @@ class Block(nn.Module):
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
-
-class ResPostBlock(nn.Module):
-    def __init__(
-            self,
-            dim: int,
-            num_heads: int,
-            mlp_ratio: float = 4.,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            scale_attn_norm: bool = False,
-            scale_mlp_norm: bool = False,
-            proj_bias: bool = True,
-            proj_drop: float = 0.,
-            attn_drop: float = 0.,
-            init_values: Optional[float] = None,
-            drop_path: float = 0.,
-            act_layer: Type[nn.Module] = nn.GELU,
-            norm_layer: Type[nn.Module] = LayerNorm,
-            mlp_layer: Type[nn.Module] = Mlp,
-            device = None,
-            dtype = None,
-    ) -> None:
-        super().__init__()
-        dd = {'device': device, 'dtype': dtype}
-        self.init_values = init_values
-
-        self.attn = AttentionWithBias(
-            dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            qk_norm=qk_norm,
-            scale_norm=scale_attn_norm,
-            proj_bias=proj_bias,
-            attn_drop=attn_drop,
-            proj_drop=proj_drop,
-            norm_layer=norm_layer,
-            **dd,
-        )
-        self.norm1 = norm_layer(dim, **dd)
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-        self.mlp = mlp_layer(
-            in_features=dim,
-            hidden_features=int(dim * mlp_ratio),
-            act_layer=act_layer,
-            norm_layer=norm_layer if scale_mlp_norm else None,
-            bias=proj_bias,
-            drop=proj_drop,
-            **dd,
-        )
-        self.norm2 = norm_layer(dim, **dd)
-        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-        self.init_weights()
-
-    def init_weights(self) -> None:
-        # NOTE this init overrides that base model init with specific changes for the block type
-        if self.init_values is not None:
-            nn.init.constant_(self.norm1.weight, self.init_values)
-            nn.init.constant_(self.norm2.weight, self.init_values)
-
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = x + self.drop_path1(self.norm1(self.attn(x, attn_mask=attn_mask)))
-        x = x + self.drop_path2(self.norm2(self.mlp(x)))
-        return x
-
-
-class ParallelScalingBlock(nn.Module):
-    """ Parallel ViT block (MLP & Attention in parallel)
-    Based on:
-      'Scaling Vision Transformers to 22 Billion Parameters` - https://arxiv.org/abs/2302.05442
-    """
-
-    def __init__(
-            self,
-            dim: int,
-            num_heads: int,
-            mlp_ratio: float = 4.,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            scale_attn_norm: bool = False,
-            scale_mlp_norm: bool = False,
-            proj_bias: bool = True,
-            proj_drop: float = 0.,
-            attn_drop: float = 0.,
-            init_values: Optional[float] = None,
-            drop_path: float = 0.,
-            act_layer: Type[nn.Module] = nn.GELU,
-            norm_layer: Type[nn.Module] = LayerNorm,
-            mlp_layer: Optional[Type[nn.Module]] = None,
-            device = None,
-            dtype = None,
-    ) -> None:
-        super().__init__()
-        dd = {'device': device, 'dtype': dtype}
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        assert not scale_attn_norm and not scale_mlp_norm, 'Scale norms not supported'
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        mlp_hidden_dim = int(mlp_ratio * dim)
-        in_proj_out_dim = mlp_hidden_dim + 3 * dim
-
-        self.in_norm = norm_layer(dim, **dd)
-        self.in_proj = nn.Linear(dim, in_proj_out_dim, bias=qkv_bias, **dd)
-        self.in_split = [mlp_hidden_dim] + [dim] * 3
-        if qkv_bias:
-            self.register_buffer('qkv_bias', None)
-            self.register_parameter('mlp_bias', None)
-        else:
-            self.register_buffer('qkv_bias', torch.zeros(3 * dim, **dd), persistent=False)
-            self.mlp_bias = nn.Parameter(torch.zeros(mlp_hidden_dim, **dd))
-
-        self.q_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim, **dd) if qk_norm else nn.Identity()
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.attn_out_proj = nn.Linear(dim, dim, bias=proj_bias, **dd)
-
-        self.mlp_drop = nn.Dropout(proj_drop)
-        self.mlp_act = act_layer()
-        self.mlp_out_proj = nn.Linear(mlp_hidden_dim, dim, bias=proj_bias, **dd)
-
-        self.ls = LayerScale(dim, init_values=init_values, **dd) if init_values is not None else nn.Identity()
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-    def forward(self, x: torch.Tensor, attn_bias: Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, N, C = x.shape
-
-        # Combined MLP fc1 & qkv projections
-        y = self.in_norm(x)
-        if self.mlp_bias is not None:
-            # Concat constant zero-bias for qkv w/ trainable mlp_bias.
-            # Appears faster than adding to x_mlp separately
-            y = F.linear(y, self.in_proj.weight, torch.cat((self.qkv_bias, self.mlp_bias)))
-        else:
-            y = self.in_proj(y)
-        x_mlp, q, k, v = torch.split(y, self.in_split, dim=-1)
-
-        # Dot product attention w/ qk norm
-        q = self.q_norm(q.view(B, N, self.num_heads, self.head_dim)).transpose(1, 2)
-        k = self.k_norm(k.view(B, N, self.num_heads, self.head_dim)).transpose(1, 2)
-        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
-        attn = attn + attn_bias
-        attn = maybe_add_mask(attn, attn_mask)
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x_attn = attn @ v
-
-        x_attn = x_attn.transpose(1, 2).reshape(B, N, C)
-        x_attn = self.attn_out_proj(x_attn)
-
-        # MLP activation, dropout, fc2
-        x_mlp = self.mlp_act(x_mlp)
-        x_mlp = self.mlp_drop(x_mlp)
-        x_mlp = self.mlp_out_proj(x_mlp)
-
-        # Add residual w/ drop path & layer scale applied
-        y = self.drop_path(self.ls(x_attn + x_mlp))
-        x = x + y
-        return x
-
-
-class ParallelThingsBlock(nn.Module):
-    """ Parallel ViT block (N parallel attention followed by N parallel MLP)
-    Based on:
-      `Three things everyone should know about Vision Transformers` - https://arxiv.org/abs/2203.09795
-    """
-    def __init__(
-            self,
-            dim: int,
-            num_heads: int,
-            num_parallel: int = 2,
-            mlp_ratio: float = 4.,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            scale_attn_norm: bool = False,
-            scale_mlp_norm: bool = False,
-            proj_bias: bool = True,
-            init_values: Optional[float] = None,
-            proj_drop: float = 0.,
-            attn_drop: float = 0.,
-            drop_path: float = 0.,
-            act_layer: Type[nn.Module] = nn.GELU,
-            norm_layer: Type[nn.Module] = LayerNorm,
-            mlp_layer: Type[nn.Module] = Mlp,
-            device = None,
-            dtype = None
-    ) -> None:
-        dd = {'device': device, 'dtype': dtype}
-        super().__init__()
-        self.num_parallel = num_parallel
-        self.attns = nn.ModuleList()
-        self.ffns = nn.ModuleList()
-        for _ in range(num_parallel):
-            self.attns.append(nn.Sequential(OrderedDict([
-                ('norm', norm_layer(dim, **dd)),
-                ('attn', AttentionWithBias(
-                    dim,
-                    num_heads=num_heads,
-                    qkv_bias=qkv_bias,
-                    qk_norm=qk_norm,
-                    scale_norm=scale_attn_norm,
-                    proj_bias=proj_bias,
-                    attn_drop=attn_drop,
-                    proj_drop=proj_drop,
-                    norm_layer=norm_layer,
-                    **dd,
-                )),
-                ('ls', LayerScale(dim, init_values=init_values, **dd) if init_values else nn.Identity()),
-                ('drop_path', DropPath(drop_path) if drop_path > 0. else nn.Identity())
-            ])))
-            self.ffns.append(nn.Sequential(OrderedDict([
-                ('norm', norm_layer(dim, **dd)),
-                ('mlp', mlp_layer(
-                    dim,
-                    hidden_features=int(dim * mlp_ratio),
-                    act_layer=act_layer,
-                    norm_layer=norm_layer if scale_mlp_norm else None,
-                    bias=proj_bias,
-                    drop=proj_drop,
-                    **dd,
-                )),
-                ('ls', LayerScale(dim, init_values=init_values, **dd) if init_values else nn.Identity()),
-                ('drop_path', DropPath(drop_path) if drop_path > 0. else nn.Identity())
-            ])))
-
-    def forward(self, x: torch.Tensor, attn_bias:Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if attn_mask is not None:
-            attn_out = []
-            for attn in self.attns:
-                x_attn = attn.norm(x)
-                x_attn = attn.attn(x_attn, attn_bias=attn_bias, attn_mask=attn_mask)
-                x_attn = attn.ls(x_attn)
-                x_attn = attn.drop_path(x_attn)
-                attn_out.append(x_attn)
-            x = x + torch.stack(attn_out).sum(dim=0)
-        else:
-            x = x + torch.stack([attn(x) for attn in self.attns]).sum(dim=0)
-        x = x + torch.stack([ffn(x) for ffn in self.ffns]).sum(dim=0)
-        return x
-
-
 def global_pool_nlc(
         x: torch.Tensor,
         pool_type: str = 'token',
@@ -648,7 +415,6 @@ class PuzzleTransformer(nn.Module):
     A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`
         - https://arxiv.org/abs/2010.11929
     """
-    dynamic_img_size: Final[bool]
 
     def __init__(
             self,
@@ -676,7 +442,6 @@ class PuzzleTransformer(nn.Module):
             final_norm: bool = True,
             fc_norm: Optional[bool] = None,
             pool_include_prefix: bool = False,
-            dynamic_img_size: bool = False,
             dynamic_img_pad: bool = False,
             drop_rate: float = 0.,
             pos_drop_rate: float = 0.,
@@ -750,13 +515,10 @@ class PuzzleTransformer(nn.Module):
         self.has_class_token = class_token
         self.no_embed_class = no_embed_class
         self.pool_include_prefix = pool_include_prefix
-        self.dynamic_img_size = dynamic_img_size
         self.grad_checkpointing = False
 
         embed_args = {}
-        if dynamic_img_size:
-            # flatten deferred until after pos embed
-            embed_args.update(dict(strict_img_size=False, output_fmt='NHWC'))
+
         if embed_norm_layer is not None:
             embed_args['norm_layer'] = embed_norm_layer
         self.patch_embed = embed_layer(
@@ -769,16 +531,13 @@ class PuzzleTransformer(nn.Module):
             **embed_args,
             **dd,
         )
-        self.piece_pos_embeds = nn.ParameterDict()
+        self.piece_pos_embed = nn.Parameter(torch.zeros(1, (img_size // patch_size), (img_size // patch_size), embed_dim, **dd) * .02)
         self.connect_buffers = nn.ParameterDict()
         for piece_size in piece_sizes:
-            piece_pos_embed = nn.Parameter(torch.zeros(1, (img_size // piece_size), (img_size // piece_size), embed_dim, **dd) * .02)
-            self.piece_pos_embeds[str(piece_size)] = piece_pos_embed
             n = (img_size // piece_size)**2
             self.connect_buffers[str(piece_size)] = nn.Parameter(torch.LongTensor(get_adjacency_matrix(n, range(n), [0]*n)).unsqueeze(0), requires_grad=False)
-        self.connect_embed = nn.Embedding(17, self.num_heads)
+        self.connect_embed = nn.Embedding(17, self.num_heads, padding_idx=0)
         self.piece_type_embed = nn.Embedding(4, self.embed_dim, padding_idx=0)
-        self.piece_type_embed.weight.data.normal_(std=0.02)
 
         num_patches = self.patch_embed.num_patches
         reduction = self.patch_embed.feat_ratio() if hasattr(self.patch_embed, 'feat_ratio') else patch_size
@@ -845,11 +604,11 @@ class PuzzleTransformer(nn.Module):
         self.shuffle_classifiers = nn.ModuleDict()
         self.rotate_classifiers = nn.ModuleDict()
         for piece_size in piece_sizes:
-            kernel_size = (piece_size // patch_size) ** 2
+            # kernel_size = (piece_size // patch_size) ** 2
             self.connect_classifiers[str(piece_size)] = ConnectClassifier(
                 dim=embed_dim,
                 num_heads=num_heads,
-                kernel_size=kernel_size,
+                kernel_size=(piece_size // patch_size) ** 2,
                 num_classes=17,
                 has_class_token=self.has_class_token,
                 norm_layer=norm_layer,
@@ -857,14 +616,14 @@ class PuzzleTransformer(nn.Module):
             )
             self.shuffle_classifiers[str(piece_size)] = PieceClassifier(
                 dim=embed_dim,
-                kernel_size=kernel_size,
+                kernel_size=(piece_size // patch_size),
                 num_classes=(img_size // piece_size) ** 2,
                 has_class_token=self.has_class_token,
                 **dd,
             )
             self.rotate_classifiers[str(piece_size)] = PieceClassifier(
                 dim=embed_dim,
-                kernel_size=kernel_size,
+                kernel_size=(piece_size // patch_size),
                 num_classes=4,
                 has_class_token=self.has_class_token,
                 **dd,
@@ -898,10 +657,8 @@ class PuzzleTransformer(nn.Module):
             nn.init.normal_(self.cls_token, std=1e-6)
         if self.reg_token is not None:
             nn.init.normal_(self.reg_token, std=1e-6)
-        if self.piece_pos_embeds is not None:
-            for piece_size, pos_embed in self.piece_pos_embeds.items():
-                trunc_normal_(pos_embed, std=.02)
-        
+        if self.piece_pos_embed is not None:
+            trunc_normal_(self.piece_pos_embed, std=.02)
 
         named_apply(get_init_weights_vit(mode, head_bias), self)
 
@@ -1003,18 +760,7 @@ class PuzzleTransformer(nn.Module):
         if self.pos_embed is None:
             return x.view(x.shape[0], -1, x.shape[-1])
 
-        if self.dynamic_img_size:
-            B, H, W, C = x.shape
-            prev_grid_size = self.patch_embed.grid_size
-            pos_embed = resample_abs_pos_embed(
-                self.pos_embed,
-                new_size=(H, W),
-                old_size=prev_grid_size,
-                num_prefix_tokens=0 if self.no_embed_class else self.num_prefix_tokens,
-            )
-            x = x.view(B, -1, C)
-        else:
-            pos_embed = self.pos_embed
+        pos_embed = self.pos_embed
 
         to_cat = []
         if self.cls_token is not None:
@@ -1040,30 +786,36 @@ class PuzzleTransformer(nn.Module):
     
     def _connect_embed(self, connects: torch.LongTensor, piece_size=None) -> torch.Tensor:
         connect_embed = self.connect_embed(connects) # B N,N,D
-        B, N, _, D = connect_embed.shape
-        n = int(math.sqrt(N))
-        connect_embed = connect_embed.permute(0, 3, 1, 2)  # B,D,N,N
-        connect_embed = connect_embed.reshape(B, D, n, n, n, n)
-        connect_embed = connect_embed.repeat_interleave(piece_size // self.patch_size, dim=2).repeat_interleave(piece_size // self.patch_size, dim=3).repeat_interleave(piece_size // self.patch_size, dim=4).repeat_interleave(piece_size // self.patch_size, dim=5)
-        connect_embed = connect_embed.flatten(2,3).flatten(3,4)  # B,D, N',N'
+        connect_embed = connect_embed.repeat_interleave((piece_size//self.patch_size)**2, dim=1).repeat_interleave((piece_size//self.patch_size)**2, dim=2).permute(0,3,1,2)
+        if self.has_class_token:
+            # add padding for class token
+            B, D, N, N = connect_embed.shape
+            pad = torch.zeros(B, D, 1, N).type_as(connect_embed)
+            connect_embed = torch.cat([pad, connect_embed], dim=2)
+            pad = torch.zeros(B, D, N+1, 1).type_as(connect_embed)
+            connect_embed = torch.cat([pad, connect_embed], dim=3)
         return connect_embed
     
     def forward_features(self, x: torch.Tensor, piece_size: int = None, piece_types: torch.LongTensor = None, connects: torch.LongTensor = None, attn_bias=None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
         x = self.patch_embed(x)
+        B, N, D = x.shape
+        n = int(math.sqrt(N))
+        k = piece_size // self.patch_size
+        x = x.reshape(B, n, n, D)
         if piece_types is not None:
-            piece_type_embed = self.piece_type_embed(piece_types)  # B, N, D
-            B, N, D = piece_type_embed.shape
-            n = int(math.sqrt(N))
-            piece_type_embed = piece_type_embed.reshape(B, n, n, D)
-            piece_type_embed = piece_type_embed.repeat_interleave(piece_size//self.patch_size, dim=1).repeat_interleave(piece_size//self.patch_size, dim=2)
-            piece_type_embed = piece_type_embed.flatten(1,2)
+            piece_type_embed = self.piece_type_embed(piece_types)
+            _, N_, _ = piece_type_embed.shape
+            n_ = int(math.sqrt(N_))
+            piece_type_embed = piece_type_embed.reshape(B, n_, n_, D)
+            piece_type_embed = piece_type_embed.repeat_interleave(k, dim=1).repeat_interleave(k, dim=2) # B, n, n, D
             x = x + piece_type_embed
         if piece_size is not None:
-            piece_pos_embed = self.piece_pos_embeds[str(piece_size)]
-            piece_pos_embed = piece_pos_embed.repeat_interleave(piece_size//self.patch_size, dim=1).repeat_interleave(piece_size//self.patch_size, dim=2)
-            piece_pos_embed = piece_pos_embed.reshape(1, (self.img_size // self.patch_size) **2, self.embed_dim)
+            piece_pos_embed = self.piece_pos_embed.reshape(1, n//k, k, n//k, k, D)
+            piece_pos_embed = piece_pos_embed.mean(dim=(2,4)) # 1, n//k, n//k, D
+            piece_pos_embed = piece_pos_embed.repeat_interleave(k, dim=1).repeat_interleave(k, dim=2) # 1, n, n, D
             x = x + piece_pos_embed
+        x = x.flatten(1, 2) # B, N, D
         x = self._pos_embed(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
@@ -1083,13 +835,13 @@ class PuzzleTransformer(nn.Module):
     def forward_local(self, x: torch.Tensor, piece_size: int = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.forward_features(x, piece_size, attn_mask=attn_mask)
         logits_connect = self.connect_classifiers[str(piece_size)](x)
-        connects_pred = logits_connect.argmax(dim=-1).detach().cpu().numpy()
+        connects_pred = logits_connect.argmax(dim=-1).detach()
         piece_types = []
-        for connect_pred in connects_pred:
+        for connect_pred in connects_pred.cpu().numpy():
             piece_type = connect_to_piece_type(connect_pred)
             piece_types.append(piece_type)
         piece_types = torch.Tensor(piece_types).type_as(x).long()
-        return logits_connect, piece_types
+        return logits_connect, connects_pred, piece_types
     
     def forward_global(self, x: torch.Tensor, piece_size: int = None, piece_types: torch.LongTensor = None, connects: torch.LongTensor = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.forward_features(x, piece_size, piece_types, connects, attn_mask=attn_mask)
@@ -1455,4 +1207,20 @@ def puzzleformer_tiny_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleT
     """
     model_args = dict(patch_size=16, piece_sizes=(16, 32, 64, 128), embed_dim=192, depth=12, num_heads=3, class_token=True)
     model = _create_vision_transformer('puzzleformer_tiny_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+@register_model
+def puzzleformer_small_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
+    """ ViT-Small (Vit-S/16)
+    """
+    model_args = dict(patch_size=16, piece_sizes=(16, 32, 64, 128), embed_dim=384, depth=12, num_heads=6, class_token=True)
+    model = _create_vision_transformer('puzzleformer_small_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+@register_model
+def puzzleformer_base_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
+    """ ViT-Base (Vit-B/16)
+    """
+    model_args = dict(patch_size=16, piece_sizes=(16, 32, 64, 128), embed_dim=768, depth=12, num_heads=12, class_token=True)
+    model = _create_vision_transformer('puzzleformer_base_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
