@@ -749,7 +749,7 @@ class PuzzleTransformer(nn.Module):
         shuffle_pred = logits_shuffle.argmax(dim=-1).detach().cpu().numpy()
         rotate_pred = logits_rotate.argmax(dim=-1).detach().cpu().numpy()
         return {
-            'logits_connects': logits_connect,
+            'logits_connects': logits_connect.detach(),
             'logits_shuffle': logits_shuffle,
             'logits_rotate': logits_rotate,
             'connects_pred': connects_pred,
@@ -1109,25 +1109,25 @@ def _create_vision_transformer(
     )
 
 @register_model
-def puzzleformer_j_tiny_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
+def puzzleformer_sr_tiny_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
     """ ViT-Tiny (Vit-Ti/16)
     """
     model_args = dict(patch_size=16, piece_sizes=(16, 32, 64, 128), embed_dim=192, depth=12, num_heads=3, class_token=True)
-    model = _create_vision_transformer('puzzleformer_j_tiny_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
+    model = _create_vision_transformer('puzzleformer_sr_tiny_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 @register_model
-def puzzleformer_j_small_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
+def puzzleformer_sr_small_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
     """ ViT-Small (Vit-S/16)
     """
     model_args = dict(patch_size=16, piece_sizes=(16, 32, 64, 128), embed_dim=384, depth=12, num_heads=6, class_token=True)
-    model = _create_vision_transformer('puzzleformer_j_small_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
+    model = _create_vision_transformer('puzzleformer_sr_small_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 @register_model
-def puzzleformer_j_base_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
+def puzzleformer_sr_base_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
     """ ViT-Base (Vit-B/16)
     """
     model_args = dict(patch_size=16, piece_sizes=(16, 32, 64, 128), embed_dim=768, depth=12, num_heads=12, class_token=True)
-    model = _create_vision_transformer('puzzleformer_j_base_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
+    model = _create_vision_transformer('puzzleformer_sr_base_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
