@@ -718,7 +718,7 @@ class PuzzleTransformer(nn.Module):
         return x
 
     
-    def forward_features(self, x: torch.Tensor, piece_size: int = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_features_pretrain(self, x: torch.Tensor, piece_size: int = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
         x = self.patch_embed(x)
         if piece_size is not None:
@@ -732,13 +732,68 @@ class PuzzleTransformer(nn.Module):
 
         x = self.norm(x)
         return x
+    
+    def forward_features(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
+        x = self.patch_embed(x)
+        for piece_size in self.piece_sizes:
+            x = self._piece_pos_embed(x, piece_size)
+        x = self._pos_embed(x)
+        x = self.patch_drop(x)
+        x = self.norm_pre(x)
+
+        for blk in self.blocks:
+            x = blk(x, attn_mask=attn_mask)
+
+        x = self.norm(x)
+        return x
+
+    def pool(self, x: torch.Tensor, pool_type: Optional[str] = None) -> torch.Tensor:
+        """Apply pooling to feature tokens.
+
+        Args:
+            x: Feature tensor.
+            pool_type: Pooling type override.
+
+        Returns:
+            Pooled features.
+        """
+        if self.attn_pool is not None:
+            if not self.pool_include_prefix:
+                x = x[:, self.num_prefix_tokens:]
+            x = self.attn_pool(x)
+            return x
+        pool_type = self.global_pool if pool_type is None else pool_type
+        x = global_pool_nlc(
+            x,
+            pool_type=pool_type,
+            num_prefix_tokens=self.num_prefix_tokens,
+            reduce_include_prefix=self.pool_include_prefix,
+        )
+        return x
+
+    def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
+        """Forward pass through classifier head.
+
+        Args:
+            x: Feature tensor.
+            pre_logits: Return features before final classifier.
+
+        Returns:
+            Output tensor.
+        """
+        x = self.pool(x)
+        x = self.fc_norm(x)
+        x = self.head_drop(x)
+        return x if pre_logits else self.head(x)
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        pass
-
+        x = self.forward_features(x, attn_mask=attn_mask)
+        x = self.forward_head(x)
+        return x
 
     def forward_pretrain(self, x: torch.Tensor, piece_size: int = None, attn_mask: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
-        x = self.forward_features(x, piece_size, attn_mask=attn_mask)
+        x = self.forward_features_pretrain(x, piece_size, attn_mask=attn_mask)
         logits_connect = self.connect_classifiers[str(piece_size)](x)
         logits_shuffle = self.shuffle_classifiers[str(piece_size)](x)
         logits_rotate = self.rotate_classifiers[str(piece_size)](x)
