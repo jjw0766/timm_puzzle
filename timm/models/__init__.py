@@ -88,6 +88,7 @@ from .xception_aligned import *
 from .xcit import *
 from .puzzleformer_src import *
 from .puzzleformer_sr import *
+from .puzzleformer_s import *
 
 
 from ._builder import (

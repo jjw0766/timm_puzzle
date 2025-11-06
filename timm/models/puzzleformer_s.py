@@ -459,10 +459,7 @@ class PuzzleTransformer(nn.Module):
             **embed_args,
             **dd,
         )
-        self.piece_pos_embeds = nn.ParameterDict()
-        for piece_size in piece_sizes:
-            num_patches_per_side = img_size // piece_size
-            self.piece_pos_embeds[str(piece_size)] = nn.Parameter(torch.zeros(1, num_patches_per_side, num_patches_per_side, embed_dim, **dd) * .02)
+        self.piece_pos_embed = nn.Parameter(torch.zeros(1, img_size // patch_size, img_size // patch_size, embed_dim, **dd) * .02)
 
         num_patches = self.patch_embed.num_patches
         reduction = self.patch_embed.feat_ratio() if hasattr(self.patch_embed, 'feat_ratio') else patch_size
@@ -582,8 +579,8 @@ class PuzzleTransformer(nn.Module):
             nn.init.normal_(self.cls_token, std=1e-6)
         if self.reg_token is not None:
             nn.init.normal_(self.reg_token, std=1e-6)
-        for piece_size, piece_pos_embed in self.piece_pos_embeds.items():
-            trunc_normal_(piece_pos_embed, std=.02)
+        if self.piece_pos_embed is not None:
+            trunc_normal_(self.piece_pos_embed, std=.02)
 
         named_apply(get_init_weights_vit(mode, head_bias), self)
 
@@ -714,18 +711,33 @@ class PuzzleTransformer(nn.Module):
         n = int(math.sqrt(N))
         k = piece_size // self.patch_size
         x = x.reshape(B, n, n, D)
-        piece_pos_embed = self.piece_pos_embeds[str(piece_size)]
+        piece_pos_embed = self.piece_pos_embed.reshape(1, n//k, k, n//k, k, D).permute(0,1,3,2,4,5).reshape(1, n//k, n//k, k*k, D).mean(dim=3) # 1, n//k, n//k, D
         piece_pos_embed = piece_pos_embed.repeat_interleave(k, dim=1).repeat_interleave(k, dim=2) # 1, n, n, D
         x = x + piece_pos_embed
+        x = x.reshape(B, N, D)
         return x
 
     
-    def forward_features(self, x: torch.Tensor, piece_size: int = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_features_pretrain(self, x: torch.Tensor, piece_size: int = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
         x = self.patch_embed(x)
         if piece_size is not None:
             x = self._piece_pos_embed(x, piece_size)
-        x = x.flatten(1, 2) # B, N, D
+        x = self._pos_embed(x)
+        x = self.patch_drop(x)
+        x = self.norm_pre(x)
+
+        for blk in self.blocks:
+            x = blk(x, attn_mask=attn_mask)
+
+        x = self.norm(x)
+        return x
+    
+    def forward_features(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
+        x = self.patch_embed(x)
+        for piece_size in self.piece_sizes:
+            x = self._piece_pos_embed(x, piece_size)
         x = self._pos_embed(x)
         x = self.patch_drop(x)
         x = self.norm_pre(x)
@@ -736,12 +748,52 @@ class PuzzleTransformer(nn.Module):
         x = self.norm(x)
         return x
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        pass
+    def pool(self, x: torch.Tensor, pool_type: Optional[str] = None) -> torch.Tensor:
+        """Apply pooling to feature tokens.
 
+        Args:
+            x: Feature tensor.
+            pool_type: Pooling type override.
+
+        Returns:
+            Pooled features.
+        """
+        if self.attn_pool is not None:
+            if not self.pool_include_prefix:
+                x = x[:, self.num_prefix_tokens:]
+            x = self.attn_pool(x)
+            return x
+        pool_type = self.global_pool if pool_type is None else pool_type
+        x = global_pool_nlc(
+            x,
+            pool_type=pool_type,
+            num_prefix_tokens=self.num_prefix_tokens,
+            reduce_include_prefix=self.pool_include_prefix,
+        )
+        return x
+
+    def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
+        """Forward pass through classifier head.
+
+        Args:
+            x: Feature tensor.
+            pre_logits: Return features before final classifier.
+
+        Returns:
+            Output tensor.
+        """
+        x = self.pool(x)
+        x = self.fc_norm(x)
+        x = self.head_drop(x)
+        return x if pre_logits else self.head(x)
+
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.forward_features(x, attn_mask=attn_mask)
+        x = self.forward_head(x)
+        return x
 
     def forward_pretrain(self, x: torch.Tensor, piece_size: int = None, attn_mask: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
-        x = self.forward_features(x, piece_size, attn_mask=attn_mask)
+        x = self.forward_features_pretrain(x, piece_size, attn_mask=attn_mask)
         logits_connect = self.connect_classifiers[str(piece_size)](x)
         logits_shuffle = self.shuffle_classifiers[str(piece_size)](x)
         logits_rotate = self.rotate_classifiers[str(piece_size)](x)
@@ -1109,25 +1161,25 @@ def _create_vision_transformer(
     )
 
 @register_model
-def puzzleformer_so_tiny_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
+def puzzleformer_s_tiny_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
     """ ViT-Tiny (Vit-Ti/16)
     """
     model_args = dict(patch_size=16, piece_sizes=(16, 32, 64, 128), embed_dim=192, depth=12, num_heads=3, class_token=True)
-    model = _create_vision_transformer('puzzleformer_so_tiny_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
+    model = _create_vision_transformer('puzzleformer_s_tiny_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 @register_model
-def puzzleformer_so_small_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
+def puzzleformer_s_small_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
     """ ViT-Small (Vit-S/16)
     """
     model_args = dict(patch_size=16, piece_sizes=(16, 32, 64, 128), embed_dim=384, depth=12, num_heads=6, class_token=True)
-    model = _create_vision_transformer('puzzleformer_so_small_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
+    model = _create_vision_transformer('puzzleformer_s_small_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 @register_model
-def puzzleformer_so_base_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
+def puzzleformer_s_base_patch16_256(pretrained: bool = False, **kwargs) -> PuzzleTransformer:
     """ ViT-Base (Vit-B/16)
     """
     model_args = dict(patch_size=16, piece_sizes=(16, 32, 64, 128), embed_dim=768, depth=12, num_heads=12, class_token=True)
-    model = _create_vision_transformer('puzzleformer_so_base_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
+    model = _create_vision_transformer('puzzleformer_s_base_patch16_256', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
