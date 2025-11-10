@@ -238,7 +238,7 @@ class PieceDecoder(nn.Module):
     def __init__(
             self,
             dim: int,
-            grid_size: int,
+            patch_size: int,
             kernel_size: int = 1,
             has_class_token: bool = True,
             device=None,
@@ -259,8 +259,8 @@ class PieceDecoder(nn.Module):
         super().__init__()
         dd = {'device': device, 'dtype': dtype}
         self.has_class_token = has_class_token
-        self.grid_size = grid_size
-        self.conv = nn.Conv2d(dim, self.grid_size * self.grid_size * 3, kernel_size, kernel_size)
+        self.patch_size = patch_size
+        self.conv = nn.Conv2d(dim, self.patch_size * self.patch_size * 3, kernel_size, kernel_size)
 
 
     def forward(
@@ -274,7 +274,7 @@ class PieceDecoder(nn.Module):
         x = x.transpose(1,2)
         x = x.reshape(B, C, n, n)
         x = self.conv(x)
-        x = x.reshape(B, 3, self.grid_size, self.grid_size, n, n).permute(0,1,4,2,5,3).reshape(B, 3, n*self.grid_size, n*self.grid_size)
+        x = x.reshape(B, 3, self.patch_size, self.patch_size, n, n).permute(0,1,4,2,5,3).reshape(B, 3, n*self.patch_size, n*self.patch_size)
         return x
 
 
@@ -597,8 +597,8 @@ class PuzzleTransformer(nn.Module):
             )
             self.piece_decoders[str(piece_size)] = PieceDecoder(
                 dim=embed_dim,
-                grid_size=piece_size,
-                kernel_size=embed_dim,
+                patch_size=patch_size,
+                kernel_size=1,
                 has_class_token=self.has_class_token,
                 **dd,
             )
