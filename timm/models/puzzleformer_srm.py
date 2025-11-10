@@ -239,6 +239,7 @@ class PieceDecoder(nn.Module):
             self,
             dim: int,
             piece_size: int,
+            kernel_size: int = 1,
             has_class_token: bool = True,
             device=None,
             dtype=None
@@ -259,7 +260,7 @@ class PieceDecoder(nn.Module):
         dd = {'device': device, 'dtype': dtype}
         self.has_class_token = has_class_token
         self.piece_size = piece_size
-        self.linear = nn.Linear(dim, self.piece_size * self.piece_size * 3)
+        self.conv = nn.Conv2d(dim, self.piece_size * self.piece_size * 3, kernel_size, kernel_size)
 
 
     def forward(
@@ -270,9 +271,10 @@ class PieceDecoder(nn.Module):
             x = x[:, 1:, :]
         B, N, C = x.shape
         n = int(N**0.5)
-        x = self.linear(x) # B, N, piece_size*piece_size*3
-        x = x.reshape(B, N, 3, self.piece_size, self.piece_size)
-        x = x.permute(0, 2, 1, 3, 4).reshape(B, 3, n * self.piece_size, n * self.piece_size)
+        x = x.transpose(1,2)
+        x = x.reshape(B, C, n, n)
+        x = self.conv(x)
+        x = x.reshape(B, 3, self.piece_size, self.piece_size, n, n).permute(0,1,4,2,5,3).reshape(B, 3, n*self.piece_size, n*self.piece_size)
         return x
 
 
@@ -596,6 +598,7 @@ class PuzzleTransformer(nn.Module):
             self.piece_decoders[str(piece_size)] = PieceDecoder(
                 dim=embed_dim,
                 piece_size=piece_size,
+                kernel_size=(piece_size // patch_size),
                 has_class_token=self.has_class_token,
                 **dd,
             )
