@@ -238,6 +238,7 @@ class PieceDecoder(nn.Module):
     def __init__(
             self,
             dim: int,
+            img_size: int,
             piece_size: int,
             kernel_size: int = 1,
             has_class_token: bool = True,
@@ -259,6 +260,7 @@ class PieceDecoder(nn.Module):
         super().__init__()
         dd = {'device': device, 'dtype': dtype}
         self.has_class_token = has_class_token
+        self.img_size = img_size
         self.piece_size = piece_size
         self.conv = nn.Conv2d(dim, self.piece_size * self.piece_size * 3, kernel_size, kernel_size)
 
@@ -274,7 +276,8 @@ class PieceDecoder(nn.Module):
         x = x.transpose(1,2)
         x = x.reshape(B, C, n, n)
         x = self.conv(x)
-        x = x.reshape(B, 3, self.piece_size, self.piece_size, n, n).permute(0,1,4,2,5,3).reshape(B, 3, n*self.piece_size, n*self.piece_size)
+        x = x.reshape(B, 3, self.piece_size, self.piece_size, self.img_size//self.piece_size, self.img_size//self.piece_size)
+        x = x.permute(0,1,4,2,5,3).reshape(B, 3, self.img_size, self.img_size)
         return x
 
 
@@ -598,6 +601,7 @@ class PuzzleTransformer(nn.Module):
             self.piece_decoders[str(piece_size)] = PieceDecoder(
                 dim=embed_dim,
                 piece_size=piece_size,
+                img_size=img_size,
                 kernel_size=(piece_size // patch_size),
                 has_class_token=self.has_class_token,
                 **dd,
