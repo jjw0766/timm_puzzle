@@ -86,6 +86,7 @@ from .vovnet import *
 from .xception import *
 from .xception_aligned import *
 from .xcit import *
+from .puzzleformer_srmc import *
 from .puzzleformer_srm import *
 from .puzzleformer_src import *
 from .puzzleformer_sr import *
