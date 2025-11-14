@@ -234,13 +234,57 @@ class PieceClassifier(nn.Module):
         x = self.clf(x)
         return x
 
-class PieceDecoder(nn.Module):
+# class PieceDecoder(nn.Module):
+#     def __init__(
+#             self,
+#             dim: int,
+#             img_size: int,
+#             piece_size: int,
+#             kernel_size: int = 1,
+#             has_class_token: bool = True,
+#             device=None,
+#             dtype=None
+#     ) -> None:
+#         """Initialize the Attention module.
+
+#         Args:
+#             dim: Input dimension of the token embeddings
+#             num_heads: Number of attention heads
+#             qkv_bias: Whether to use bias in the query, key, value projections
+#             qk_norm: Whether to apply normalization to query and key vectors
+#             proj_bias: Whether to use bias in the output projection
+#             attn_drop: Dropout rate applied to the attention weights
+#             proj_drop: Dropout rate applied after the output projection
+#             norm_layer: Normalization layer constructor for QK normalization if enabled
+#         """
+#         super().__init__()
+#         dd = {'device': device, 'dtype': dtype}
+#         self.has_class_token = has_class_token
+#         self.img_size = img_size
+#         self.piece_size = piece_size
+#         self.conv = nn.Conv2d(dim, self.piece_size * self.piece_size * 3, kernel_size, kernel_size)
+
+
+#     def forward(
+#             self,
+#             x: torch.Tensor,
+#     ) -> torch.Tensor:
+#         if self.has_class_token:
+#             x = x[:, 1:, :]
+#         B, N, C = x.shape
+#         n = int(N**0.5)
+#         x = x.transpose(1,2)
+#         x = x.reshape(B, C, n, n)
+#         x = self.conv(x)
+#         x = x.reshape(B, 3, self.piece_size, self.piece_size, self.img_size//self.piece_size, self.img_size//self.piece_size)
+#         x = x.permute(0,1,4,2,5,3).reshape(B, 3, self.img_size, self.img_size)
+#         return x
+
+class PatchDecoder(nn.Module):
     def __init__(
             self,
             dim: int,
-            img_size: int,
-            piece_size: int,
-            kernel_size: int = 1,
+            patch_size,
             has_class_token: bool = True,
             device=None,
             dtype=None
@@ -260,9 +304,8 @@ class PieceDecoder(nn.Module):
         super().__init__()
         dd = {'device': device, 'dtype': dtype}
         self.has_class_token = has_class_token
-        self.img_size = img_size
-        self.piece_size = piece_size
-        self.conv = nn.Conv2d(dim, self.piece_size * self.piece_size * 3, kernel_size, kernel_size)
+        self.patch_size = patch_size
+        self.conv = nn.Conv2d(dim, self.patch_size * self.patch_size * 3)
 
 
     def forward(
@@ -276,8 +319,8 @@ class PieceDecoder(nn.Module):
         x = x.transpose(1,2)
         x = x.reshape(B, C, n, n)
         x = self.conv(x)
-        x = x.reshape(B, 3, self.piece_size, self.piece_size, self.img_size//self.piece_size, self.img_size//self.piece_size)
-        x = x.permute(0,1,4,2,5,3).reshape(B, 3, self.img_size, self.img_size)
+        x = x.reshape(B, 3, self.patch_size, self.patch_size, n, n)
+        x = x.permute(0,1,4,2,5,3).reshape(B, 3, n*self.patch_size, n*self.patch_size)
         return x
 
 
@@ -572,7 +615,6 @@ class PuzzleTransformer(nn.Module):
         self.connect_classifiers = nn.ModuleDict()
         self.shuffle_classifiers = nn.ModuleDict()
         self.rotate_classifiers = nn.ModuleDict()
-        self.piece_decoders = nn.ModuleDict()
         for piece_size in piece_sizes:
             # kernel_size = (piece_size // patch_size) ** 2
             self.connect_classifiers[str(piece_size)] = ConnectClassifier(
@@ -598,14 +640,12 @@ class PuzzleTransformer(nn.Module):
                 has_class_token=self.has_class_token,
                 **dd,
             )
-            self.piece_decoders[str(piece_size)] = PieceDecoder(
-                dim=embed_dim,
-                piece_size=piece_size,
-                img_size=img_size,
-                kernel_size=(piece_size // patch_size),
-                has_class_token=self.has_class_token,
-                **dd,
-            )
+        self.patch_decoder = PatchDecoder(
+            dim=embed_dim,
+            patch_size=patch_size,
+            has_class_token=self.has_class_token,
+            **dd,
+        )
 
         if weight_init != 'skip':
             self.init_weights(weight_init)
@@ -853,7 +893,7 @@ class PuzzleTransformer(nn.Module):
         logits_connect = self.connect_classifiers[str(piece_size)](x)
         logits_shuffle = self.shuffle_classifiers[str(piece_size)](x)
         logits_rotate = self.rotate_classifiers[str(piece_size)](x)
-        decoded = self.piece_decoders[str(piece_size)](x)
+        decoded = self.patch_decoder(x)
         connects_pred = logits_connect.argmax(dim=-1).detach().cpu().numpy()
         shuffle_pred = logits_shuffle.argmax(dim=-1).detach().cpu().numpy()
         rotate_pred = logits_rotate.argmax(dim=-1).detach().cpu().numpy()
